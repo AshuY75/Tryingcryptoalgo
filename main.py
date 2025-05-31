@@ -1,151 +1,123 @@
-import ccxt
-import pandas as pd
-import ta
 import time
+import datetime
 import requests
-from datetime import datetime
+import pandas as pd
+import numpy as np
+from pybit.unified_trading import HTTP
+from dotenv import load_dotenv
+import os
 
-# === Telegram Bot Config ===
+# Load secrets from .env
+load_dotenv()
 
-BOT_TOKEN = '7724103910:AAHGjqgh_nmhdJMxDDqrFt1JhMqWq9j9Y9o'
-CHAT_ID = '721677346'
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+BYBIT_API_KEY = os.getenv("BYBIT_API_KEY")
+BYBIT_API_SECRET = os.getenv("BYBIT_API_SECRET")
 
-def send_telegram_message(text):
-    url = f'https://api.telegram.org/bot{7724103910:AAHGjqgh_nmhdJMxDDqrFt1JhMqWq9j9Y9o}/sendMessage'  # yahan BOT_TOKEN variable use karo
-    data = {'chat_id': CHAT_ID, 'text': text, 'parse_mode': 'Markdown'}
+session = HTTP(testnet=False, api_key=BYBIT_API_KEY, api_secret=BYBIT_API_SECRET)
+SYMBOLS = ["BTCUSDT", "ETHUSDT"]
+
+def send_telegram_message(message):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
     try:
-        response = requests.post(url, data=data)
-        if response.status_code != 200:
-            print(f"Telegram send failed: {response.text}")
+        response = requests.post(url, data=payload)
+        if response.status_code == 200:
+            print("[TELEGRAM] Message sent.")
+        else:
+            print(f"[TELEGRAM] Failed: {response.text}")
     except Exception as e:
-        print(f"Telegram error: {e}")
+        print(f"[ERROR] Telegram error: {e}")
 
+def save_signal(symbol, signal_type, price, rsi, time_stamp):
+    df = pd.DataFrame([[symbol, signal_type, price, rsi, time_stamp]],
+                      columns=["Symbol", "Type", "Price", "RSI", "Time"])
+    df.to_csv("signals.csv", mode='a', header=False, index=False)
+    print("[SAVE] Signal logged.")
 
-# === Exchange & Symbols Config ===
-exchange = ccxt.binance({'enableRateLimit': True})
-symbols = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT']
-timeframe = '1h'
-
-# Tracking stats per symbol
-stats_dict = {
-    sym: {
-        'position': None,       # 'long', 'short', or None
-        'entry_price': 0.0,
-        'total_trades': 0,
-        'profitable_trades': 0,
-        'cumulative_profit_pct': 0.0,
-        'last_signal_time': None
-    } for sym in symbols
-}
-
-def fetch_ohlcv(symbol):
+def fetch_ohlcv(symbol, interval="60", limit=100):
     try:
-        ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=100)
-        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        result = session.get_kline(
+            category="linear",
+            symbol=symbol,
+            interval=interval,
+            limit=limit
+        )
+        data = result['result']['list']
+        df = pd.DataFrame(data, columns=[
+            "timestamp", "open", "high", "low", "close", "volume", "turnover"
+        ])
+        df[["timestamp", "open", "high", "low", "close", "volume", "turnover"]] = df[["timestamp", "open", "high", "low", "close", "volume", "turnover"]].astype(float)
+        df['close'] = df['close'].astype(float)
         return df
     except Exception as e:
-        print(f"Fetch error for {symbol}: {e}")
+        print(f"[ERROR] Failed to fetch OHLCV for {symbol}: {e}")
         return None
 
-def calculate_indicators(df):
-    df['rsi'] = ta.momentum.RSIIndicator(df['close'], window=14).rsi()
-    bb_indicator = ta.volatility.BollingerBands(df['close'], window=20, window_dev=2)
-    df['bb_upper'] = bb_indicator.bollinger_hband()
-    df['bb_middle'] = bb_indicator.bollinger_mavg()
-    df['bb_lower'] = bb_indicator.bollinger_lband()
-    return df
+def calculate_rsi(df, period=14):
+    delta = df['close'].diff()
+    gain = delta.where(delta > 0, 0.0)
+    loss = -delta.where(delta < 0, 0.0)
+    avg_gain = gain.rolling(window=period).mean()
+    avg_loss = loss.rolling(window=period).mean()
+    rs = avg_gain / avg_loss
+    rsi = 100 - (100 / (1 + rs))
+    return rsi.iloc[-1]
 
-def check_signals(df, position):
-    last = df.iloc[-1]
-    prev = df.iloc[-2]
+def calculate_bollinger_bands(df, period=20):
+    sma = df['close'].rolling(window=period).mean()
+    std = df['close'].rolling(window=period).std()
+    upper_band = sma.iloc[-1] + (2 * std.iloc[-1])
+    lower_band = sma.iloc[-1] - (2 * std.iloc[-1])
+    return upper_band, lower_band
 
-    buy_signal = False
-    sell_signal = False
-    exit_signal = False
+print("[INFO] Bot started successfully.")
+send_telegram_message("🤖 Bot started and running!")
 
-    # Buy: RSI crosses below 25 and close < lower BB (only if no position)
-    if position is None:
-        if prev['rsi'] > 25 and last['rsi'] <= 25 and last['close'] < last['bb_lower']:
-            buy_signal = True
+last_candle_time = None
 
-        # Sell: RSI crosses above 75 and close > upper BB (only if no position)
-        elif prev['rsi'] < 75 and last['rsi'] >= 75 and last['close'] > last['bb_upper']:
-            sell_signal = True
+while True:
+    print(f"\n[LOOP] Checking signals...")
+    max_candle_time = None
 
-    # Exit signals: close crosses middle BB depending on position
-    if position == 'long' and last['close'] >= last['bb_middle']:
-        exit_signal = True
-    elif position == 'short' and last['close'] <= last['bb_middle']:
-        exit_signal = True
+    for symbol in SYMBOLS:
+        print(f"[FETCH] Getting OHLCV for {symbol}")
+        df = fetch_ohlcv(symbol, interval='60', limit=100)
+        if df is None or df.empty:
+            print(f"[WARN] Skipping {symbol} due to no data.\n")
+            continue
 
-    return buy_signal, sell_signal, exit_signal
+        # Get last candle time from timestamp column (milliseconds to seconds)
+        candle_time = df['timestamp'].iloc[-1]
+        if max_candle_time is None or candle_time > max_candle_time:
+            max_candle_time = candle_time
 
-def main():
-    print("Starting scalping strategy monitoring...")
+        price = df['close'].iloc[-1]
+        rsi = calculate_rsi(df)
+        upper_band, lower_band = calculate_bollinger_bands(df)
+        current_time = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
-    while True:
-        for symbol in symbols:
-            df = fetch_ohlcv(symbol)
-            if df is None or len(df) < 20:
-                continue
+        print(f"[DATA] {symbol} | Price: {price:.2f} | RSI: {rsi:.2f} | BB Upper: {upper_band:.2f} | BB Lower: {lower_band:.2f}")
 
-            df = calculate_indicators(df)
-            stats = stats_dict[symbol]
-            buy, sell, exit_pos = check_signals(df, stats['position'])
-            current_close = df.iloc[-1]['close']
-            now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        if rsi >= 70 and price >= upper_band:
+            msg = f"🔴 SELL SIGNAL: {symbol}\nPrice: {price:.2f}\nRSI: {rsi:.2f}\nTime: {current_time}"
+            send_telegram_message(msg)
+            save_signal(symbol, 'SELL', price, rsi, current_time)
+        elif rsi <= 30 and price <= lower_band:
+            msg = f"🟢 BUY SIGNAL: {symbol}\nPrice: {price:.2f}\nRSI: {rsi:.2f}\nTime: {current_time}"
+            send_telegram_message(msg)
+            save_signal(symbol, 'BUY', price, rsi, current_time)
+        else:
+            print(f"[INFO] No signal for {symbol} at {current_time}")
 
-            if buy:
-                msg = f"🟢 *BUY* signal on *{symbol}* 📈\n_Time_: {now}"
-                send_telegram_message(msg)
-                stats['position'] = 'long'
-                stats['entry_price'] = current_close
-                stats['total_trades'] += 1
-                stats['last_signal_time'] = now
-                print(f"{symbol}: BUY signal sent.")
+    # Convert max_candle_time to readable format and check if it's a new candle
+    if max_candle_time and (last_candle_time is None or max_candle_time != last_candle_time):
+        readable = datetime.datetime.fromtimestamp(max_candle_time / 1000).strftime('%Y-%m-%d %H:%M:%S')
+        msg = f"⏰ New 1-hour candle at {readable}. Bot is alive and running."
+        print(f"[INFO] {msg}")
+        send_telegram_message(msg)
+        last_candle_time = max_candle_time
 
-            elif sell:
-                msg = f"🔴 *SELL* signal on *{symbol}* 📉\n_Time_: {now}"
-                send_telegram_message(msg)
-                stats['position'] = 'short'
-                stats['entry_price'] = current_close
-                stats['total_trades'] += 1
-                stats['last_signal_time'] = now
-                print(f"{symbol}: SELL signal sent.")
-
-            elif exit_pos and stats['position'] is not None:
-                # Calculate profit percent
-                entry_price = stats['entry_price']
-                profit_pct = 0.0
-                if stats['position'] == 'long':
-                    profit_pct = ((current_close - entry_price) / entry_price) * 100
-                elif stats['position'] == 'short':
-                    profit_pct = ((entry_price - current_close) / entry_price) * 100
-
-                stats['cumulative_profit_pct'] += profit_pct
-                if profit_pct > 0:
-                    stats['profitable_trades'] += 1
-
-                profit_emoji = "💰" if profit_pct > 0 else "⚠️"
-                msg = (
-                    f"⏹️ *EXIT* {stats['position'].upper()} on *{symbol}*\n"
-                    f"_Time_: {now}\n"
-                    f"{profit_emoji} Profit: *{profit_pct:.2f}%*\n"
-                    f"📊 Total Trades: *{stats['total_trades']}*\n"
-                    f"✅ Profitable Trades: *{stats['profitable_trades']}*\n"
-                    f"📈 Cumulative Profit: *{stats['cumulative_profit_pct']:.2f}%*"
-                )
-                send_telegram_message(msg)
-                print(f"{symbol}: EXIT signal sent. Profit: {profit_pct:.2f}%")
-                stats['position'] = None
-                stats['entry_price'] = 0.0
-                stats['last_signal_time'] = now
-
-            else:
-                print(f"{symbol}: No signal at {now}")
-
-        time.sleep(30)  # check every 30 seconds but using 1h timeframe data
-
-if __name__ == "__main__":
-    main()
+    print("[SLEEP] Waiting 30 seconds...\n")
+    time.sleep(30)
