@@ -1,4 +1,5 @@
-ccxt
-pandas
-ta
+pybit
 requests
+pandas
+numpy
+python-dotenv
